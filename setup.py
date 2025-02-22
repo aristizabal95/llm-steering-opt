@@ -6,6 +6,6 @@ setup(
    description='A library for optimizing steering vectors in LLMs.',
    author='Jacob Dunefsky',
    author_email='jacob.dunefsky@yale.edu',
-   packages=['steering_opt'],  #same as name
+   py_modules=['steering_opt'],
    install_requires=['mdmm', 'numpy', 'torch']
 )
