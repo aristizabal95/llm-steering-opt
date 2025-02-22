@@ -4,7 +4,7 @@ This library contains functions for optimizing steering vectors for LLMs that in
 
 For a quick tutorial on how to use this library, take a look at the notebook `quickstart.ipynb`.
 
-For per-function documentation, refer to the docstrings in `steering_opt/steering_opt.py`. (Nicer documentation pages are currently under construction.)
+For per-function documentation, refer to the docstrings in `steering_opt.py`. (Nicer documentation pages are currently under construction.)
 
 For an in-depth look at what you can do with steering vector optimization, please refer to our paper [Investigating Generalization of One-shot LLM Steering Vectors](https://github.com/jacobdunefsky/one-shot-steering-repro), where we apply steering vector optimization to tasks such as harmful behavior suppression in alignment-faking models, refusal suppression, and fictitious information generation modulation.
 
