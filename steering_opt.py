@@ -282,6 +282,8 @@ class TrainingDatapoint:
 		prompt (str): the prompt used in this datapoint
 		src_completions (optional, list of strs): a list of completions whose probabilities on this prompt should be minimized by the steering vector (i.e. suppression steering targets)
 		dst_completions (optional, list of strs): a list of completions whose probabilities on this prompt should be maximized by the steering vector (i.e. promotion steering targets)
+		src_completions_target_losses (optional, list of floats): a list of target losses for each suppression steering target, such that if all targets' losses fall below their respective given target losses, the optimization process will stop early
+		dst_completions_target_losses (optional, list of floats): a list of target losses for each promotion steering target, such that if all targets' losses fall below their respective given target losses, the optimization process will stop early
 		token (optional, slice or int): the tokens in this prompt that steering should be applied to when optimizing on this datapoint. If not given, then steering will be applied to all tokens.
 		is_negative (False by default): if True, then the vector being optimized will be negated on this datapoint
 	"""
@@ -289,6 +291,8 @@ class TrainingDatapoint:
 	prompt: str
 	src_completions: List[str] = dataclasses.field(default_factory=list)
 	dst_completions: List[str] = dataclasses.field(default_factory=list)
+	src_completions_target_losses: Optional[List[float]] = None
+	dst_completions_target_losses: Optional[List[float]] = None
 	token: Optional[Union[slice, int]] = None
 	is_negative: bool = False
 
@@ -442,14 +446,16 @@ def optimize_vector(model, datapoints, layer,
 	vec_history = []
 	def check_if_target_loss_hit(all_completion_losses, target_loss):
 		target_loss_hit = True
-		for datapoint_losses in all_completion_losses:
-			for src_completion_loss in datapoint_losses[0]:
-				if src_completion_loss > target_loss:
+		for datapoint, datapoint_losses in zip(datapoints, all_completion_losses):
+			for i, src_completion_loss in enumerate(datapoint_losses[0]):
+				cur_target_loss = target_loss if datapoint.src_completions_target_losses is None else datapoint.src_completions_target_losses[i]
+				if src_completion_loss > cur_target_loss:
 					target_loss_hit = False
 					break
 			if not target_loss_hit: break # god I wish that Python just let us use GOTOs
-			for dst_completion_loss in datapoint_losses[1]:
-				if dst_completion_loss > target_loss:
+			for i, dst_completion_loss in enumerate(datapoint_losses[1]):
+				cur_target_loss = target_loss if datapoint.dst_completions_target_losses is None else datapoint.dst_completions_target_losses[i]
+				if dst_completion_loss > cur_target_loss:
 					target_loss_hit = False
 					break
 			if not target_loss_hit: break
