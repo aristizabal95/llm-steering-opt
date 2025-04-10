@@ -245,7 +245,7 @@ def sample_most_likely_completions_hf(model, tokenizer, dst_prompt, src_prompt=N
 		if not use_total_probs:
 			v, idxs = torch.topk(prob_diffs.flatten(), k=k)
 		else:
-			prod_val = torch.tensor(cur_completion_probs).to(device).prod(dim=-1)
+			prod_val = torch.tensor(cur_completion_probs).prod(dim=-1).to(prob_diffs.device)
 			total_prob_diffs = torch.einsum('nd, n -> nd', prob_diffs, prod_val)
 			_, idxs = torch.topk(total_prob_diffs.flatten(), k=k)
 			v = prob_diffs.flatten()[idxs]
@@ -309,7 +309,7 @@ def optimize_vector(model, datapoints, layer,
 	target_loss_target_iters=1, satisfice=False, do_one_minus=True,
 	max_norm=None, starting_norm=1, starting_vec=None,
 	vector_clamp=None, affine_rank=None, max_affine_norm=2, starting_affine_norm=1,
-	noise_scale=None, do_tangent_space_noise=True, do_noise_abl_relu=False, noise_iters=1,
+	noise_scale=None, do_tangent_space_noise=True, do_noise_abl_relu=False, noise_iters=1, do_antipgd=False,
 	do_output_constr=False, custom_output_constr_loss_func=None, custom_output_constr_pre_loss_func=None,
 	output_constr_norm_initial_scale=1, output_constr_lr=None, max_output_constr_iters=None,
 	debug=False,
@@ -366,6 +366,7 @@ def optimize_vector(model, datapoints, layer,
 			do_tangent_space_noise (True by default): if True, then project the noise vector onto the tangent space of the loss w.r.t. the steering vector. (Ideally, an approximation to prevent noise from inducing instability in the loss.)
 			do_noise_abl_relu (False by default): only takes effect when do_tangent_space_noise is set. If True, then only ablates the component of the noise vector that points in the direction of decreasing loss (i.e. don't do ablation if the noise vector points in the direction of increasing loss). Ideally, this approximates choosing noise that only ever increases the loss or keeps it the same.
 			noise_iters (1 by default): how many times noise should be sampled at each optimization step before updating the steering vector.
+			do_antipgd (False by default): if True, then uses anti-correlated noise (see https://proceedings.mlr.press/v162/orvieto22a/orvieto22a.pdf)
 
 		Output-constrained steering args:
 			do_output_constr (False by default): if True, then perform output-constrained steering. This entails the following: after finding a steering vector that satisfies the target loss, then perform constrained minimization to optimize a vector with the smallest norm that does not increase the loss.
@@ -527,8 +528,10 @@ def optimize_vector(model, datapoints, layer,
 			cur_loss = cur_loss / completion_len
 
 		return cur_loss
-	
+
+	prev_noise = 0
 	def get_completion_loss_with_noise(datapoint_idx, completion_idx, vector, matrix, is_src_completion=True, do_one_minus=True):
+		nonlocal prev_noise
 		if noise_scale is None: return get_completion_loss(datapoint_idx, completion_idx, vector, matrix, is_src_completion=is_src_completion)
 
 		noise = 0
@@ -541,7 +544,10 @@ def optimize_vector(model, datapoints, layer,
 		#		get_completion_loss(datapoint_idx, completion_idx, noise, matrix, is_src_completion=is_src_completion)
 
 		if not do_tangent_space_noise:
-			return get_completion_loss(datapoint_idx, completion_idx, vector + noise, matrix, is_src_completion=is_src_completion)
+			new_noise = noise
+			if do_antipgd: new_noise = noise - prev_noise
+			prev_noise = noise
+			return get_completion_loss(datapoint_idx, completion_idx, vector + new_noise.to(device=vector.device), matrix, is_src_completion=is_src_completion)
 
 		# time to do tangent space noise
 		# here's the procedure:
@@ -605,7 +611,9 @@ def optimize_vector(model, datapoints, layer,
 					cur_loss = get_completion_loss_with_noise(datapoint_idx, src_completion_idx, vector, matrix, is_src_completion=True, do_one_minus=do_one_minus)
 					loss += cur_loss.item()
 					all_completion_losses[datapoint_idx][0][src_completion_idx] = cur_loss.item()
-					if satisfice: cur_loss = (cur_loss - target_loss)**2
+					if satisfice:
+						cur_target_loss = target_loss if datapoint.src_completions_target_losses is None else datapoint.src_completions_target_losses[src_completion_idx]
+						cur_loss = (cur_loss - cur_target_loss)**2
 					cur_loss.backward()
 
 			for dst_completion_idx in range(len(datapoint.dst_completions)):
@@ -618,7 +626,9 @@ def optimize_vector(model, datapoints, layer,
 					cur_loss = get_completion_loss_with_noise(datapoint_idx, dst_completion_idx, vector, matrix, is_src_completion=False)
 					loss += cur_loss.item()
 					all_completion_losses[datapoint_idx][1][dst_completion_idx] = cur_loss.item()
-					if satisfice: cur_loss = (cur_loss - target_loss)**2
+					if satisfice:
+						cur_target_loss = target_loss if datapoint.dst_completions_target_losses is None else datapoint.dst_completions_target_losses[dst_completion_idx]
+						cur_loss = (cur_loss - cur_target_loss)**2
 					cur_loss.backward()
 
 		#loss /= len(datapoints)
@@ -649,7 +659,7 @@ def optimize_vector(model, datapoints, layer,
 				matrix_left[:] = torch.einsum('rm, r -> rm', matrix_left, affine_coeffs_left)
 				matrix_right[:] = torch.einsum('rm, r -> rm', matrix_right, affine_coeffs_right)
 		if return_loss_history: loss_history.append(loss)
-		if return_vec_history: vec_history.append([x.detach().cpu().float().numpy() for x in params])
+		if return_vec_history: vec_history.append([x.detach().clone().cpu().float().numpy() for x in params])
 		iters += 1
 
 	if debug:
