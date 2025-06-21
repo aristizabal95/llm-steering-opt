@@ -1,9 +1,11 @@
 import torch
 from typing import List, Tuple, Callable, Optional, Union
+from steering_opt.model_wrappers.factory import get_model_wrapper
 import dataclasses
 from contextlib import contextmanager
 import mdmm
 import numpy as np
+
 
 # utility function
 def _nested_list_max(l):
@@ -34,7 +36,8 @@ def hf_hooks_contextmanager(model, hook_infos : List[Tuple[int, Callable]]):
 	"""
 
 	# set up hooks
-	hooks = [ model.model.layers[cur_layer].register_forward_pre_hook(hook_fn) for cur_layer, hook_fn in hook_infos]
+	wrapper = get_model_wrapper(model)
+	hooks = [ wrapper.layers[cur_layer].register_forward_pre_hook(hook_fn) for cur_layer, hook_fn in hook_infos]
 	# yield execution
 	try:
 		yield
@@ -145,8 +148,8 @@ def get_completion_logprob(model, prompt, completion, tokenizer=None, coldness=1
 	else:
 		if tokenizer is None:
 			raise Exception("Not using TransformerLens -- but tokenizer is None!")
-		get_tokens = lambda prompt: tokenizer(prompt).input_ids
-		get_logits = lambda prompt: model(tokenizer(prompt, return_tensors='pt').input_ids, **kwargs).logits[0]
+		get_tokens = lambda prompt: tokenizer(text=prompt).input_ids
+		get_logits = lambda prompt: model(tokenizer(text=prompt, return_tensors='pt').input_ids, **kwargs).logits[0]
 
 	prompt_tokens = get_tokens(prompt)
 	prompt_len = len(prompt_tokens)
@@ -388,6 +391,7 @@ def optimize_vector(model, datapoints, layer,
 			output_constr_iters (optional): if output-constrained optimization was performed, then the number of optimization steps taken during the output-constrained optimization phase
 			
 	"""
+	wrapper = get_model_wrapper(model)
 	if use_transformer_lens:
 		if output_constr_lr is None: output_constr_lr = lr
 	if use_transformer_lens:
@@ -401,10 +405,10 @@ def optimize_vector(model, datapoints, layer,
 	else:
 		if tokenizer is None:
 			raise Exception("Not using TransformerLens -- but tokenizer is None!")
-		d_model = model.config.hidden_size
-		get_tokens = lambda prompt: tokenizer(prompt).input_ids
+		d_model = wrapper.d_model
+		get_tokens = lambda prompt: tokenizer(text=prompt).input_ids
 		def get_hooked_logits(prompt, hook_infos):
-			cur_tokens = tokenizer(prompt, return_tensors='pt').input_ids
+			cur_tokens = tokenizer(text=prompt, return_tensors='pt').input_ids
 			with hf_hooks_contextmanager(model, hook_infos):
 				logits = model(cur_tokens, use_cache=False).logits[0]
 			return logits 
@@ -901,10 +905,11 @@ def optimize_vector_minibatch_hf(model, tokenizer, prompts, layer,
 
 	if src_completions is None: src_completions = []
 	if dst_completions is None: dst_completions = []
-	d_model = model.config.hidden_size
-	get_tokens = lambda prompt: tokenizer(prompt).input_ids
+	wrapper = get_model_wrapper(model)
+	d_model = wrapper.d_model
+	get_tokens = lambda prompt: tokenizer(text=prompt).input_ids
 	def get_hooked_logits(prompt, hook_infos):
-		cur_tokens = tokenizer(prompt, return_tensors='pt', padding=True, padding_side='left').input_ids
+		cur_tokens = tokenizer(text=prompt, return_tensors='pt', padding=True, padding_side='left').input_ids
 		with hf_hooks_contextmanager(model, hook_infos):
 			logits = model(cur_tokens, use_cache=False).logits
 		return logits 
