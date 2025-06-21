@@ -788,6 +788,332 @@ def optimize_vector(model, datapoints, layer,
 		retvals = retvals + (retdict,)
 	return retvals
 
+
+def optimize_vectors(model, datapoints, layers,
+	eps=1e-6, lr=0.01, max_iters=None, coldness=0.7,
+	normalize_token_length=False, only_hook_prompt=False, use_transformer_lens=False, tokenizer=None,
+	target_loss=None, return_info=True, do_target_loss_sum=True, return_loss_history=False, return_vec_history=False,
+	target_loss_target_iters=1, satisfice=False, do_one_minus=True,
+	max_norm=None, starting_norm=1, starting_vecs=None,
+	vector_clamp=None, affine_rank=None, max_affine_norm=2, starting_affine_norm=1,
+	noise_scale=None, do_tangent_space_noise=True, do_noise_abl_relu=False, noise_iters=1, do_antipgd=False,
+	regularization_weight=0.01, regularization_type="l1",
+	debug=False,
+):
+	"""
+	Optimize multiple steering vectors on a set of datapoints, one vector per layer.
+
+	Args:
+		Required args:
+			model: the model to optimize the steering vectors for
+			datapoints (list of TrainingDatapoints): the list of TrainingDatapoints to optimize over
+			layers (list of ints): the layers to apply steering vectors to. One vector will be optimized for each layer.
+
+		Regularization args:
+			regularization_weight (float, 0.01 by default): weight for the regularization term
+			regularization_type (str, "l1" by default): type of regularization. Options are "l1" (sum of L1 norms) or "max" (sum of max absolute values)
+
+		Other args are the same as in optimize_vector(), except:
+			- starting_vecs (optional): if given, should be a list of vectors to initialize the vectors being optimized, one per layer
+			- max_norm, vector_clamp, affine_rank not supported in this version for simplicity
+	
+	Returns a tuple containing the following elements in order:
+		vectors: a dictionary mapping layer indices to their optimized steering vectors
+		info (optional): if return_info is True, then a dictionary containing info about the optimization process
+	"""
+	# Ensure layers is a list
+	if isinstance(layers, int):
+		layers = [layers]
+	
+	wrapper = get_model_wrapper(model)
+	if use_transformer_lens:
+		d_model = model.cfg.d_model
+		get_tokens = lambda prompt: model.to_tokens(prompt).tolist()[0]
+		def get_hooked_logits(prompt, hook_infos):
+			fwd_hooks = [(f'blocks.{cur_layer}.hook_resid_pre', hook_fn) for cur_layer, hook_fn in hook_infos]
+			with model.hooks(fwd_hooks=fwd_hooks):
+				return model(prompt)[0]
+		make_steering_hook = make_steering_hook_tflens
+	else:
+		if tokenizer is None:
+			raise Exception("Not using TransformerLens -- but tokenizer is None!")
+		d_model = wrapper.d_model
+		get_tokens = lambda prompt: tokenizer(text=prompt).input_ids
+		def get_hooked_logits(prompt, hook_infos):
+			cur_tokens = tokenizer(text=prompt, return_tensors='pt').input_ids
+			with hf_hooks_contextmanager(model, hook_infos):
+				logits = model(cur_tokens, use_cache=False).logits[0]
+			return logits 
+		make_steering_hook = make_steering_hook_hf
+	
+	# Initialize vectors for each layer
+	vectors = {}
+	if starting_vecs is None:
+		with torch.no_grad():
+			for layer_idx in layers:
+				vector = torch.randn(d_model)
+				vector = starting_norm * vector / vector.norm()
+				vector = vector.cuda()
+				vectors[layer_idx] = vector
+	else:
+		if len(starting_vecs) != len(layers):
+			raise ValueError("starting_vecs must have the same length as layers")
+		for layer_idx, starting_vec in zip(layers, starting_vecs):
+			vectors[layer_idx] = starting_vec.detach().clone()
+	
+	# Make all vectors require gradients
+	for vector in vectors.values():
+		vector.requires_grad_(True)
+
+	# Prepare data structures
+	all_src_completions_tokens = []
+	all_dst_completions_tokens = []
+	all_prompt_lens = []
+
+	all_completion_losses = []
+	loss_history = []
+	vec_history = []
+	
+	def check_if_target_loss_hit(all_completion_losses, target_loss):
+		target_loss_hit = True
+		for datapoint, datapoint_losses in zip(datapoints, all_completion_losses):
+			for i, src_completion_loss in enumerate(datapoint_losses[0]):
+				cur_target_loss = target_loss if datapoint.src_completions_target_losses is None else datapoint.src_completions_target_losses[i]
+				if src_completion_loss > cur_target_loss:
+					target_loss_hit = False
+					break
+			if not target_loss_hit:
+				break
+			for i, dst_completion_loss in enumerate(datapoint_losses[1]):
+				cur_target_loss = target_loss if datapoint.dst_completions_target_losses is None else datapoint.dst_completions_target_losses[i]
+				if dst_completion_loss > cur_target_loss:
+					target_loss_hit = False
+					break
+			if not target_loss_hit:
+				break
+		return target_loss_hit
+
+	for datapoint in datapoints:
+		prompt = datapoint.prompt
+		prompt_tokens = get_tokens(prompt)
+		prompt_len = len(prompt_tokens)
+		
+		src_completions = datapoint.src_completions
+		dst_completions = datapoint.dst_completions
+
+		src_completions_tokens = []
+		for src_completion in src_completions:
+			src_completions_tokens.append(get_tokens(prompt + src_completion)[prompt_len:])
+		dst_completions_tokens = []
+		for dst_completion in dst_completions:
+			dst_completions_tokens.append(get_tokens(prompt + dst_completion)[prompt_len:])
+
+		all_completion_losses.append([
+			[None for _ in range(len(src_completions))],
+			[None for _ in range(len(dst_completions))],
+		])
+
+		all_src_completions_tokens.append(src_completions_tokens)
+		all_dst_completions_tokens.append(dst_completions_tokens)
+		all_prompt_lens.append(prompt_len)
+
+	params = list(vectors.values())
+
+	def get_completion_loss(datapoint_idx, completion_idx, vectors_dict, is_src_completion=True, do_one_minus=True):
+		datapoint = datapoints[datapoint_idx]
+		prompt = datapoint.prompt
+		prompt_len = all_prompt_lens[datapoint_idx]
+
+		completion = datapoint.src_completions[completion_idx] if is_src_completion else datapoint.dst_completions[completion_idx]
+		completion_tokens = all_src_completions_tokens[datapoint_idx][completion_idx] if is_src_completion else all_dst_completions_tokens[datapoint_idx][completion_idx]
+		completion_len = len(completion_tokens)
+
+		# Create hooks for each layer with its corresponding vector
+		hook_infos = []
+		for layer_idx, vector in vectors_dict.items():
+			if datapoint.is_negative:
+				vector = -vector
+			
+			if only_hook_prompt:
+				if vector_clamp is None:
+					hook_fn = make_steering_hook(vector, matrix=None, token=slice(0, prompt_len))
+				else:
+					hook_fn = make_steering_hook(vector_clamp*vector, matrix=make_abl_mat(vector), token=slice(0, prompt_len))
+			else:
+				if vector_clamp is None:
+					hook_fn = make_steering_hook(vector, matrix=None, token=datapoint.token)
+				else:
+					hook_fn = make_steering_hook(vector_clamp*vector, matrix=make_abl_mat(vector), token=datapoint.token)
+			
+			hook_infos.append((layer_idx, hook_fn))
+		
+		cur_loss = 0
+
+		logits = get_hooked_logits(prompt + completion, hook_infos)
+		probs = torch.nn.functional.softmax(logits*coldness, dim=-1)
+
+		for completion_token_idx in range(0, completion_len):
+			completion_token = completion_tokens[completion_token_idx]
+			prompt_token_idx = prompt_len+completion_token_idx-1
+			target_prob = torch.log(1-probs[prompt_token_idx, completion_token] + eps) if is_src_completion and do_one_minus else torch.log(probs[prompt_token_idx, completion_token] + eps)
+			if is_src_completion and not do_one_minus:
+				target_prob = -target_prob
+			if debug:
+				print(datapoint_idx, completion_idx, completion_token_idx, is_src_completion, target_prob.item(), completion_token)
+
+			cur_loss -= target_prob
+		if normalize_token_length:
+			cur_loss = cur_loss / completion_len
+
+		return cur_loss
+
+	prev_noise = {layer_idx: 0 for layer_idx in layers}
+	def get_completion_loss_with_noise(datapoint_idx, completion_idx, vectors_dict, is_src_completion=True, do_one_minus=True):
+		nonlocal prev_noise
+		if noise_scale is None:
+			return get_completion_loss(datapoint_idx, completion_idx, vectors_dict, is_src_completion=is_src_completion, do_one_minus=do_one_minus)
+
+		# Add noise to vectors
+		noisy_vectors = {}
+		for layer_idx, vector in vectors_dict.items():
+			if noise_scale is not None:
+				noise = torch.randn(vector.shape) * noise_scale
+				noise = noise.detach()
+
+				if not do_tangent_space_noise:
+					new_noise = noise
+					if do_antipgd:
+						new_noise = noise - prev_noise[layer_idx]
+					prev_noise[layer_idx] = noise
+					noisy_vectors[layer_idx] = vector + new_noise.to(device=vector.device)
+				else:
+					# Tangent space noise (simplified version)
+					noisy_vectors[layer_idx] = vector + noise.to(device=vector.device)
+			else:
+				noisy_vectors[layer_idx] = vector
+
+		return get_completion_loss(datapoint_idx, completion_idx, noisy_vectors, is_src_completion=is_src_completion, do_one_minus=do_one_minus)
+
+	def compute_regularization(vectors_dict):
+		"""Compute regularization term for all vectors"""
+		reg_loss = 0
+		if regularization_type == "l1":
+			for vector in vectors_dict.values():
+				reg_loss += torch.sum(torch.abs(vector))
+		elif regularization_type == "max":
+			for vector in vectors_dict.values():
+				reg_loss += torch.max(torch.abs(vector))
+		else:
+			raise ValueError(f"Unknown regularization_type: {regularization_type}")
+		return regularization_weight * reg_loss
+
+	optimizer = torch.optim.Adam(params, lr=lr)
+
+	loss = None
+	prev_loss = None
+	iters = 0
+	target_loss_cur_iters = 0
+	prev_loss_cur_iters = 0
+
+	while True:
+		if max_iters is not None and iters > max_iters:
+			if debug:
+				print("Max iters reached.")	
+			break
+		if target_loss is not None and loss is not None:
+			if do_target_loss_sum:
+				if loss <= (target_loss if not satisfice else target_loss + eps):
+					target_loss_cur_iters += 1
+					if debug:
+						print(f"Loss stopping threshold {target_loss} hit. Cur num iters: {target_loss_cur_iters}")
+				else:
+					target_loss_cur_iters = 0
+
+			if not do_target_loss_sum:
+				target_loss_hit = check_if_target_loss_hit(all_completion_losses, target_loss if not satisfice else target_loss + eps) 
+				if target_loss_hit:
+					target_loss_cur_iters += 1
+					if debug:
+						print(f"Loss stopping threshold {target_loss} hit. All completion losses: {all_completion_losses}. Cur num iters: {target_loss_cur_iters}")
+				else:
+					target_loss_cur_iters = 0
+
+			if target_loss_cur_iters >= target_loss_target_iters:
+				if debug:
+					print(f"Loss stopping threshold {target_loss} hit. Breaking.")
+				break
+
+		optimizer.zero_grad()
+		prev_loss = loss
+		loss = 0
+
+		for datapoint_idx, datapoint in enumerate(datapoints):
+			for src_completion_idx in range(len(datapoint.src_completions)):
+				for noise_iter in range(noise_iters):
+					cur_loss = get_completion_loss_with_noise(datapoint_idx, src_completion_idx, vectors, is_src_completion=True, do_one_minus=do_one_minus)
+					loss += cur_loss.item()
+					all_completion_losses[datapoint_idx][0][src_completion_idx] = cur_loss.item()
+					if satisfice:
+						cur_target_loss = target_loss if datapoint.src_completions_target_losses is None else datapoint.src_completions_target_losses[src_completion_idx]
+						cur_loss = (cur_loss - cur_target_loss)**2
+					cur_loss.backward()
+
+			for dst_completion_idx in range(len(datapoint.dst_completions)):
+				for noise_iter in range(noise_iters):
+					cur_loss = get_completion_loss_with_noise(datapoint_idx, dst_completion_idx, vectors, is_src_completion=False)
+					loss += cur_loss.item()
+					all_completion_losses[datapoint_idx][1][dst_completion_idx] = cur_loss.item()
+					if satisfice:
+						cur_target_loss = target_loss if datapoint.dst_completions_target_losses is None else datapoint.dst_completions_target_losses[dst_completion_idx]
+						cur_loss = (cur_loss - cur_target_loss)**2
+					cur_loss.backward()
+
+		# Add regularization term
+		reg_loss = compute_regularization(vectors)
+		reg_loss.backward()
+		loss += reg_loss.item()
+
+		if prev_loss is not None and abs(prev_loss - loss) < eps:
+			prev_loss_cur_iters += 1
+		if prev_loss_cur_iters >= target_loss_target_iters:
+			if debug:
+				print("prev_loss reached")
+				print("prev_loss, loss:", prev_loss, loss)
+			break
+
+		optimizer.step()
+
+		# Apply norm constraints if specified
+		with torch.no_grad():
+			if max_norm is not None:
+				for vector in vectors.values():
+					if torch.linalg.norm(vector) > max_norm:
+						vector[:] = max_norm * vector / torch.linalg.norm(vector)
+
+		if return_loss_history:
+			loss_history.append(loss)
+		if return_vec_history:
+			vec_history.append({layer_idx: vector.detach().clone().cpu().float().numpy() for layer_idx, vector in vectors.items()})
+		iters += 1
+
+	if debug:
+		print("Final loss:", loss)
+		print("Number of iters:", iters)
+		if prev_loss is not None:
+			print("Difference between current loss and previous iter's loss:", abs(prev_loss - loss))
+
+	retdict = {}
+	retdict['iters'] = iters
+	retdict['loss'] = loss if do_target_loss_sum else (all_completion_losses if not return_loss_history else loss_history)
+	if return_vec_history:
+		retdict['vec_history'] = vec_history
+	retdict['norms'] = {layer_idx: vector.norm().item() for layer_idx, vector in vectors.items()}
+
+	retvals = (vectors,)
+	if return_info:
+		retvals = retvals + (retdict,)
+	return retvals
+
 def make_melbo_loss_funcs(target_layer):
 	"""
 	Make custom loss functions for performing MELBO (www.lesswrong.com/posts/ioPnHKFyy4Cw2Gr2x) in conjunction with output-constrained optimization. Only supports TransformerLens.
