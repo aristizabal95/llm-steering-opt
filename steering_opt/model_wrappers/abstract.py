@@ -1,17 +1,19 @@
-class ModelWrapper:
+from abc import abstractmethod, ABC 
+
+class ModelWrapper(ABC):
     def __init__(self, model):
         self.model = model
 
-    @abstractmethod
     @property
+    @abstractmethod
     def layers(self):
         """
         The layers of the model.
         """
         pass
     
-    @abstractmethod
     @property
+    @abstractmethod
     def d_model(self):
         """
         The dimension of the model.

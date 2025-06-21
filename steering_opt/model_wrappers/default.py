@@ -1,4 +1,4 @@
-from model_wrappers.abstract import ModelWrapper
+from steering_opt.model_wrappers.abstract import ModelWrapper
 
 
 class DefaultModelWrapper(ModelWrapper):
@@ -7,7 +7,7 @@ class DefaultModelWrapper(ModelWrapper):
 
     @property
     def layers(self):
-        return self.model.model.layer
+        return self.model.model.layers
     
     @property
     def d_model(self):

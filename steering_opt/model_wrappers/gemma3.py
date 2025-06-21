@@ -1,4 +1,5 @@
-from model_wrappers.abstract import ModelWrapper
+from steering_opt.model_wrappers.abstract import ModelWrapper
+
 
 class Gemma3Wrapper(ModelWrapper):
     def __init__(self, model):
