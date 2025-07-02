@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from typing import List, Tuple, Callable, Optional, Union
 from steering_opt.model_wrappers.factory import get_model_wrapper
 import dataclasses
@@ -71,7 +72,7 @@ def make_steering_hook_hf(vector_, matrix=None, token=None):
 	def hook_fn(module, args):
 		x = args[0]
 		vector = vector_.to(x) if isinstance(vector_, torch.Tensor) else vector_
-		x_sliced = x[:, token].detach().clone()
+		x_sliced = x[:, token].clone()
 		x[:, token] = x_sliced + vector
 
 		if matrix is not None:
@@ -798,6 +799,8 @@ def optimize_vectors(model, datapoints, layers,
 	vector_clamp=None, affine_rank=None, max_affine_norm=2, starting_affine_norm=1,
 	noise_scale=None, do_tangent_space_noise=True, do_noise_abl_relu=False, noise_iters=1, do_antipgd=False,
 	regularization_weight=0.01, regularization_type="l1",
+	gradient_normalization=True, sparsity_weight=0.1,
+	entropy_weight=0.01,
 	debug=False,
 ):
 	"""
@@ -812,6 +815,13 @@ def optimize_vectors(model, datapoints, layers,
 		Regularization args:
 			regularization_weight (float, 0.01 by default): weight for the regularization term
 			regularization_type (str, "l1" by default): type of regularization. Options are "l1" (sum of L1 norms) or "max" (sum of max absolute values)
+
+		New optimization features:
+			gradient_normalization (bool, True by default): if True, normalize gradients across layers to prevent later layers from dominating
+			sparsity_weight (float, 0.1 by default): weight for group sparsity regularization that encourages most layers to have zero vectors
+
+		Entropy args:
+			entropy_weight (float, 0.01 by default): weight for entropy regularization that encourages winner-take-all behavior
 
 		Other args are the same as in optimize_vector(), except:
 			- starting_vecs (optional): if given, should be a list of vectors to initialize the vectors being optimized, one per layer
@@ -995,8 +1005,10 @@ def optimize_vectors(model, datapoints, layers,
 		return get_completion_loss(datapoint_idx, completion_idx, noisy_vectors, is_src_completion=is_src_completion, do_one_minus=do_one_minus)
 
 	def compute_regularization(vectors_dict):
-		"""Compute regularization term for all vectors"""
+		"""Compute regularization term for all vectors with group sparsity"""
 		reg_loss = 0
+		
+		# Standard regularization (L1 or max norm)
 		if regularization_type == "l1":
 			for vector in vectors_dict.values():
 				reg_loss += torch.sum(torch.abs(vector))
@@ -1005,7 +1017,20 @@ def optimize_vectors(model, datapoints, layers,
 				reg_loss += torch.max(torch.abs(vector))
 		else:
 			raise ValueError(f"Unknown regularization_type: {regularization_type}")
-		return regularization_weight * reg_loss
+		
+		# Group sparsity regularization - encourages most layers to have zero vectors
+		layer_norms = torch.stack([vector.norm() for vector in vectors_dict.values()])
+		sparsity_loss = torch.sum(layer_norms)
+		
+		return regularization_weight * reg_loss + sparsity_weight * sparsity_loss
+
+	def compute_entropy_loss(vectors_dict):
+		vectors_matrix = torch.concat([vector.unsqueeze(0) for vector in vectors.values()])
+		norms = torch.linalg.norm(vectors_matrix, axis=1)
+		probs = F.softmax(norms, dim=0)
+		entropy = torch.distributions.Categorical(probs).entropy()
+		return entropy_weight * entropy
+
 
 	optimizer = torch.optim.Adam(params, lr=lr)
 
@@ -1072,6 +1097,11 @@ def optimize_vectors(model, datapoints, layers,
 		reg_loss = compute_regularization(vectors)
 		reg_loss.backward()
 		loss += reg_loss.item()
+
+		# Add entropy loss
+		entropy_loss = compute_entropy_loss(vectors)
+		entropy_loss.backward()
+		loss += entropy_loss.item()
 
 		if prev_loss is not None and abs(prev_loss - loss) < eps:
 			prev_loss_cur_iters += 1
