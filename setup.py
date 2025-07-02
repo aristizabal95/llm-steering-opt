@@ -1,4 +1,4 @@
-from setuptools import setup
+from setuptools import setup, find_packages
 
 setup(
    name='steering_opt',
@@ -6,6 +6,11 @@ setup(
    description='A library for optimizing steering vectors in LLMs.',
    author='Jacob Dunefsky',
    author_email='jacob.dunefsky@yale.edu',
-   py_modules=['steering_opt'],
-   install_requires=['mdmm', 'numpy', 'torch']
+   packages=find_packages(),
+   install_requires=[
+       'mdmm==0.1.3',
+       'numpy==2.2.3', 
+       'torch==2.3.1',
+       'transformers==4.45.2'
+   ]
 )
